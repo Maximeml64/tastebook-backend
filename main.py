@@ -62,7 +62,13 @@ Retourne uniquement le JSON, rien d'autre."""
         )
         
         raw = message.content[0].text.strip()
-        data = json.loads(raw)
+# Supprimer les backticks markdown si présents
+if raw.startswith("```"):
+    raw = raw.split("```")[1]
+    if raw.startswith("json"):
+        raw = raw[4:]
+raw = raw.strip()
+data = json.loads(raw)
         return data
         
     except json.JSONDecodeError:
