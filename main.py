@@ -1,5 +1,4 @@
 import os
-import base64
 import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,38 +40,34 @@ async def scan_label(req: ScanRequest):
                         },
                         {
                             "type": "text",
-                            "text": """Analyse cette étiquette de vin ou spiritueux et retourne UNIQUEMENT un objet JSON valide, sans markdown, sans explication.
-
-Champs à extraire :
-- name (string) : nom du château, domaine ou produit
-- producer (string) : nom du producteur si différent du nom
-- appellation (string) : appellation ou région
-- vintage (number|null) : millésime (année à 4 chiffres)
-- grape_varieties (array of strings) : cépages si mentionnés
-- type (string) : "wine" ou "spirit"
-- color (string) : "red", "white", "rosé", "sparkling" si c'est un vin, null si spiritueux
-- category (string) : catégorie si spiritueux (whisky, rum, cognac, etc.), null si vin
-
-Si une information n'est pas visible sur l'étiquette, utilise null ou tableau vide.
-Retourne uniquement le JSON, rien d'autre."""
+                            "text": (
+                                "Analyse cette etiquette de vin ou spiritueux et retourne UNIQUEMENT "
+                                "un objet JSON valide, sans markdown, sans explication, sans backticks.\n\n"
+                                "Champs a extraire:\n"
+                                "- name (string): nom du chateau, domaine ou produit\n"
+                                "- producer (string): nom du producteur si different du nom\n"
+                                "- appellation (string): appellation ou region\n"
+                                "- vintage (number|null): millesime annee 4 chiffres\n"
+                                "- grape_varieties (array of strings): cepages si mentionnes\n"
+                                "- type (string): wine ou spirit\n"
+                                "- color (string): red white rose sparkling si vin null si spiritueux\n"
+                                "- category (string): categorie si spiritueux null si vin\n\n"
+                                "Si une information nest pas visible utilise null ou tableau vide.\n"
+                                "Retourne uniquement le JSON brut rien dautre."
+                            )
                         }
                     ],
                 }
             ],
         )
-        
         raw = message.content[0].text.strip()
-# Supprimer les backticks markdown si présents
-if raw.startswith("```"):
-    raw = raw.split("```")[1]
-    if raw.startswith("json"):
-        raw = raw[4:]
-raw = raw.strip()
-data = json.loads(raw)
+        lines = raw.split("\n")
+        lines = [l for l in lines if not l.startswith("```")]
+        raw = "\n".join(lines).strip()
+        data = json.loads(raw)
         return data
-        
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=422, detail="Impossible de parser la réponse Claude")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=422, detail=f"JSON parse error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
