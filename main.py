@@ -1,14 +1,10 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import anthropic
-from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from datetime import datetime, timezone
 from collections import defaultdict
 import threading
@@ -47,32 +43,37 @@ class ScanRequest(BaseModel):
     images: List[ImageItem]
 
 
-# In-memory rate limiter for /scan-invoice (per device, not per IP)
-_device_calls: dict[str, list[float]] = defaultdict(list)
+# In-memory rate limiters per device (keyed by endpoint)
+_device_calls: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
 _device_calls_lock = threading.Lock()
 
 
-def check_invoice_rate_limit(device_id: str, max_per_day: int = 20):
+def check_device_rate_limit(endpoint: str, device_id: str, max_per_day: int):
     now = datetime.now(timezone.utc).timestamp()
     window = 86400  # 24h
     with _device_calls_lock:
-        calls = _device_calls[device_id]
-        calls = [t for t in calls if now - t < window]
+        bucket = _device_calls[endpoint]
+        calls = [t for t in bucket[device_id] if now - t < window]
         if len(calls) >= max_per_day:
             oldest = min(calls)
             retry_after_seconds = int(window - (now - oldest))
-            _device_calls[device_id] = calls
+            bucket[device_id] = calls
             raise HTTPException(
                 status_code=429,
                 detail=f"Rate limit exceeded: max {max_per_day} scans per 24h. Retry after {retry_after_seconds}s.",
                 headers={"Retry-After": str(retry_after_seconds)}
             )
         calls.append(now)
-        _device_calls[device_id] = calls
+        bucket[device_id] = calls
 
 
 @app.post("/scan-label", dependencies=[Depends(verify_api_key)])
-async def scan_label(req: ScanRequest):
+async def scan_label(req: ScanRequest, x_device_id: Optional[str] = Header(default=None)):
+    if not x_device_id:
+        raise HTTPException(status_code=400, detail="Missing X-Device-Id header")
+
+    check_device_rate_limit("scan-label", x_device_id, max_per_day=50)
+
     try:
         if not req.images:
             raise HTTPException(status_code=400, detail="No images provided")
@@ -108,7 +109,7 @@ async def scan_label(req: ScanRequest):
         })
 
         message = client.messages.create(
-            model="claude-opus-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=512,
             messages=[{"role": "user", "content": content}],
         )
@@ -120,6 +121,8 @@ async def scan_label(req: ScanRequest):
         data = json.loads(raw)
         return data
 
+    except HTTPException:
+        raise
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=422, detail=f"JSON parse error: {str(e)}")
     except Exception as e:
@@ -131,7 +134,7 @@ async def scan_invoice(req: ScanRequest, x_device_id: Optional[str] = Header(def
     if not x_device_id:
         raise HTTPException(status_code=400, detail="Missing X-Device-Id header")
 
-    check_invoice_rate_limit(x_device_id, max_per_day=20)
+    check_device_rate_limit("scan-invoice", x_device_id, max_per_day=20)
 
     if not req.images:
         raise HTTPException(status_code=400, detail="No images provided")
