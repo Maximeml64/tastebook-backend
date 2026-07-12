@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Claude Code / claude-flow tooling (local only)
+.claude/
+.claude-flow/
