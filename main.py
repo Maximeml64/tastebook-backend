@@ -166,7 +166,9 @@ async def scan_label(req: ScanRequest, request: Request, x_device_id: Optional[s
                 "- color (string): red white rose sparkling si vin null si spiritueux\n"
                 "- category (string): categorie si spiritueux null si vin\n\n"
                 "Si une information nest pas visible utilise null ou tableau vide.\n"
-                "Retourne uniquement le JSON brut rien dautre."
+                "Si aucune etiquette nest lisible ou si limage ne montre pas de bouteille, "
+                "retourne quand meme lobjet JSON complet avec tous les champs a null.\n"
+                "Retourne uniquement le JSON brut rien dautre, jamais de phrase."
             )
         })
 
