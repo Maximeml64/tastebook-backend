@@ -1,7 +1,8 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import anthropic
@@ -28,10 +29,28 @@ BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY")
 if not BACKEND_API_KEY:
     raise RuntimeError("BACKEND_API_KEY env var is required")
 
+# Garde-fous de coût (surchargeables par env var Railway).
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(8 * 1024 * 1024)))
+MAX_IMAGE_BASE64_CHARS = int(os.environ.get("MAX_IMAGE_BASE64_CHARS", str(5 * 1024 * 1024)))
+MAX_IMAGES_PER_REQUEST = int(os.environ.get("MAX_IMAGES_PER_REQUEST", "4"))
+IP_HOURLY_LIMIT = int(os.environ.get("IP_HOURLY_LIMIT", "120"))
+GLOBAL_DAILY_CAP = int(os.environ.get("GLOBAL_DAILY_CAP", "1500"))
+
+IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+DOCUMENT_MEDIA_TYPES = {"application/pdf"}
+
 
 def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
     if not x_api_key or x_api_key != BACKEND_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+@app.middleware("http")
+async def limit_body_size(request: Request, call_next):
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"detail": f"Request body too large (max {MAX_BODY_BYTES} bytes)"})
+    return await call_next(request)
 
 
 class ImageItem(BaseModel):
@@ -43,41 +62,74 @@ class ScanRequest(BaseModel):
     images: List[ImageItem]
 
 
-# In-memory rate limiters per device (keyed by endpoint)
-_device_calls: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-_device_calls_lock = threading.Lock()
+def validate_images(images: List[ImageItem], allowed_media_types: set):
+    if not images:
+        raise HTTPException(status_code=400, detail="No images provided")
+    if len(images) > MAX_IMAGES_PER_REQUEST:
+        raise HTTPException(status_code=400, detail=f"Too many images (max {MAX_IMAGES_PER_REQUEST})")
+    for img in images:
+        if img.media_type not in allowed_media_types:
+            raise HTTPException(status_code=400, detail=f"Unsupported media_type {img.media_type}")
+        if not img.image_base64 or len(img.image_base64) > MAX_IMAGE_BASE64_CHARS:
+            raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_IMAGE_BASE64_CHARS} base64 chars)")
 
 
-def check_device_rate_limit(endpoint: str, device_id: str, max_per_day: int):
+# In-memory rate limiters (keyed by endpoint then by device / ip / global)
+_calls: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+_calls_lock = threading.Lock()
+
+
+def _consume(bucket_name: str, key: str, max_calls: int, window_seconds: int, status: int, message: str):
     now = datetime.now(timezone.utc).timestamp()
-    window = 86400  # 24h
-    with _device_calls_lock:
-        bucket = _device_calls[endpoint]
-        calls = [t for t in bucket[device_id] if now - t < window]
-        if len(calls) >= max_per_day:
-            oldest = min(calls)
-            retry_after_seconds = int(window - (now - oldest))
-            bucket[device_id] = calls
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limit exceeded: max {max_per_day} scans per 24h. Retry after {retry_after_seconds}s.",
-                headers={"Retry-After": str(retry_after_seconds)}
-            )
+    with _calls_lock:
+        bucket = _calls[bucket_name]
+        calls = [t for t in bucket[key] if now - t < window_seconds]
+        if len(calls) >= max_calls:
+            retry_after_seconds = int(window_seconds - (now - min(calls)))
+            bucket[key] = calls
+            raise HTTPException(status_code=status, detail=message, headers={"Retry-After": str(retry_after_seconds)})
         calls.append(now)
-        bucket[device_id] = calls
+        bucket[key] = calls
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def check_rate_limits(endpoint: str, request: Request, device_id: str, max_per_day: int):
+    # 1. Fusible global : protège la facture Anthropic même si les identifiants
+    #    d'appareil sont falsifiés.
+    _consume("global", "all", GLOBAL_DAILY_CAP, 86400, 503, "Service temporarily unavailable (daily capacity reached)")
+    # 2. Par IP (horaire) : l'identifiant d'appareil est choisi par le client, l'IP non.
+    _consume("ip", client_ip(request), IP_HOURLY_LIMIT, 3600, 429, f"Rate limit exceeded: max {IP_HOURLY_LIMIT} requests per hour.")
+    # 3. Par appareil (quotidien) : limite d'usage normale, visible par l'app.
+    _consume(endpoint, device_id, max_per_day, 86400, 429, f"Rate limit exceeded: max {max_per_day} scans per 24h.")
+
+
+def first_text(message) -> str:
+    for block in message.content:
+        if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+            return block.text.strip()
+    raise HTTPException(status_code=502, detail="Empty model response")
+
+
+def parse_json_text(raw: str):
+    lines = [l for l in raw.split("\n") if not l.startswith("```")]
+    return json.loads("\n".join(lines).strip())
 
 
 @app.post("/scan-label", dependencies=[Depends(verify_api_key)])
-async def scan_label(req: ScanRequest, x_device_id: Optional[str] = Header(default=None)):
+async def scan_label(req: ScanRequest, request: Request, x_device_id: Optional[str] = Header(default=None)):
     if not x_device_id:
         raise HTTPException(status_code=400, detail="Missing X-Device-Id header")
 
-    check_device_rate_limit("scan-label", x_device_id, max_per_day=50)
+    validate_images(req.images, IMAGE_MEDIA_TYPES)
+    check_rate_limits("scan-label", request, x_device_id, max_per_day=50)
 
     try:
-        if not req.images:
-            raise HTTPException(status_code=400, detail="No images provided")
-
         content = []
         for img in req.images:
             content.append({
@@ -114,12 +166,7 @@ async def scan_label(req: ScanRequest, x_device_id: Optional[str] = Header(defau
             messages=[{"role": "user", "content": content}],
         )
 
-        raw = message.content[0].text.strip()
-        lines = raw.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
-        raw = "\n".join(lines).strip()
-        data = json.loads(raw)
-        return data
+        return parse_json_text(first_text(message))
 
     except HTTPException:
         raise
@@ -130,14 +177,12 @@ async def scan_label(req: ScanRequest, x_device_id: Optional[str] = Header(defau
 
 
 @app.post("/scan-invoice", dependencies=[Depends(verify_api_key)])
-async def scan_invoice(req: ScanRequest, x_device_id: Optional[str] = Header(default=None)):
+async def scan_invoice(req: ScanRequest, request: Request, x_device_id: Optional[str] = Header(default=None)):
     if not x_device_id:
         raise HTTPException(status_code=400, detail="Missing X-Device-Id header")
 
-    check_device_rate_limit("scan-invoice", x_device_id, max_per_day=20)
-
-    if not req.images:
-        raise HTTPException(status_code=400, detail="No images provided")
+    validate_images(req.images, IMAGE_MEDIA_TYPES | DOCUMENT_MEDIA_TYPES)
+    check_rate_limits("scan-invoice", request, x_device_id, max_per_day=20)
 
     try:
         content = []
@@ -203,12 +248,7 @@ async def scan_invoice(req: ScanRequest, x_device_id: Optional[str] = Header(def
             messages=[{"role": "user", "content": content}],
         )
 
-        raw = message.content[0].text.strip()
-        lines = raw.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
-        raw = "\n".join(lines).strip()
-        data = json.loads(raw)
-        return data
+        return parse_json_text(first_text(message))
 
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=422, detail=f"JSON parse error: {str(e)}")
@@ -228,7 +268,7 @@ class GenerateRecipesRequest(BaseModel):
 
 
 @app.post("/generate-recipes", dependencies=[Depends(verify_api_key)])
-async def generate_recipes(req: GenerateRecipesRequest, x_device_id: Optional[str] = Header(default=None)):
+async def generate_recipes(req: GenerateRecipesRequest, request: Request, x_device_id: Optional[str] = Header(default=None)):
     """
     Genere des recettes a partir d'une liste d'ingredients (feature 'qu'est-ce que j'ai dans mon frigo').
     Retourne du JSON brut pret a etre injecte dans le store front.
@@ -248,7 +288,7 @@ async def generate_recipes(req: GenerateRecipesRequest, x_device_id: Optional[st
     servings = max(1, min(req.servings or 4, 12))
     count = max(1, min(req.count or 3, 5))
 
-    check_device_rate_limit("generate-recipes", x_device_id, max_per_day=5)
+    check_rate_limits("generate-recipes", request, x_device_id, max_per_day=5)
 
     ingredients_str = ", ".join(cleaned)
 
@@ -294,11 +334,7 @@ async def generate_recipes(req: GenerateRecipesRequest, x_device_id: Optional[st
             messages=[{"role": "user", "content": prompt_text}],
         )
 
-        raw = message.content[0].text.strip()
-        lines = raw.split("\n")
-        lines = [l for l in lines if not l.startswith("```")]
-        raw = "\n".join(lines).strip()
-        data = json.loads(raw)
+        data = parse_json_text(first_text(message))
 
         # Validation legere de la structure pour eviter d'envoyer des donnees pourries au front
         if not isinstance(data, dict) or not isinstance(data.get("recipes"), list):
