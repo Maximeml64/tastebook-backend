@@ -117,8 +117,18 @@ def first_text(message) -> str:
 
 
 def parse_json_text(raw: str):
+    # Le modele repond parfois avec une phrase autour du JSON ("Voici le JSON : {...}")
+    # ou des backticks : on isole le premier objet JSON complet.
     lines = [l for l in raw.split("\n") if not l.startswith("```")]
-    return json.loads("\n".join(lines).strip())
+    text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            raise
+        return json.loads(text[start:end + 1])
 
 
 @app.post("/scan-label", dependencies=[Depends(verify_api_key)])
